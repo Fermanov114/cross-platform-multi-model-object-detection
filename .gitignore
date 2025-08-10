@@ -1,5 +1,10 @@
-# Ignore images in live_input folder
+# Ignore images in live_input
 live_input/*.jpg
 live_input/*.jpeg
 live_input/*.png
 live_input/*.bmp
+
+# Ignore all generated files under results/, but keep the folder itself via a placeholder
+results/*
+!results/.gitkeep
+
