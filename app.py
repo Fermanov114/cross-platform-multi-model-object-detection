@@ -1,9 +1,11 @@
 # app.py
 import io
-import pandas as pd
-import matplotlib.pyplot as plt
-import streamlit as st
+import os
 from pathlib import Path
+
+import matplotlib.pyplot as plt
+import pandas as pd
+import streamlit as st
 
 from config import MODELS, LIVE_INPUT_DIR, LOG_FILE
 from image_sources import (
@@ -21,6 +23,7 @@ st.title("Multi-Model Multi-Platform Detection Comparison")
 st.sidebar.header("Select Image")
 def _load_existing():
     return list_local_images()
+
 existing = _load_existing()
 selected_image_path = None
 if existing:
@@ -66,6 +69,28 @@ if st.sidebar.button("Fetch All New Images"):
 st.sidebar.header("Model")
 model_name = st.sidebar.selectbox("Select Model", MODELS)
 
+# ===== Sidebar: log download / clear =====
+st.sidebar.header("Logs")
+if Path(LOG_FILE).exists():
+    with open(LOG_FILE, "rb") as f:
+        st.sidebar.download_button(
+            label="Download Detection Log CSV",
+            data=f,
+            file_name="detections.csv",
+            mime="text/csv",
+        )
+else:
+    st.sidebar.info("No detection logs available.")
+
+if st.sidebar.button("🗑️ Clear Detection Logs"):
+    try:
+        if Path(LOG_FILE).exists():
+            os.remove(LOG_FILE)
+        st.sidebar.success("Detection logs cleared.")
+        st.rerun()
+    except Exception as e:
+        st.sidebar.error(f"Failed to clear logs: {e}")
+
 # ===== Main: run detection & show results =====
 if selected_image_path:
     st.subheader(f"Detection Results — {Path(selected_image_path).name}")
@@ -108,25 +133,11 @@ if selected_image_path:
                     st.metric("CPU / Memory", f"{gpu_metrics['cpu_percent']}% / {gpu_metrics['mem_percent']}%")
             else:
                 st.warning("GPU is not available on this machine or GPU inference was skipped.")
-
         except Exception as e:
             st.error(f"Detection failed: {e}")
 
-# ===== Sidebar: log download =====
-st.sidebar.header("Logs")
-if Path(LOG_FILE).exists():
-    with open(LOG_FILE, "rb") as f:
-        st.sidebar.download_button(
-            label="Download Detection Log CSV",
-            data=f,
-            file_name="detections.csv",
-            mime="text/csv",
-        )
-else:
-    st.sidebar.info("No detection logs available.")
-
 # =======================================================================
-# =============== NEW: Cross-Platform Comparison section ================
+# =============== Cross-Platform Comparison section =====================
 # =======================================================================
 st.header("Cross-Platform Comparison")
 
@@ -141,14 +152,50 @@ ext_csv_files = st.file_uploader(
     "Upload external CSV files", type=["csv"], accept_multiple_files=True, key="ext_csvs"
 )
 
+# ---------- utilities ----------
+REQ_COLS = ["image_name", "image_sha", "platform", "model", "inference_ms", "fps"]
+
 def _read_csv_any(path_or_bytes) -> pd.DataFrame:
-    try:
-        if isinstance(path_or_bytes, (str, Path)):
-            return pd.read_csv(path_or_bytes)
-        else:
-            return pd.read_csv(io.BytesIO(path_or_bytes.getvalue()))
-    except Exception:
+    # robust loader: tolerate bad lines / encodings / mixed columns
+    read_kwargs = dict(on_bad_lines="skip", engine="python")
+    try_orders = [
+        lambda x: pd.read_csv(x, **read_kwargs),
+        lambda x: pd.read_csv(x, encoding="utf-8-sig", **read_kwargs),
+        lambda x: pd.read_csv(x, encoding="latin-1", **read_kwargs),
+    ]
+    for fn in try_orders:
+        try:
+            if isinstance(path_or_bytes, (str, Path)):
+                df = fn(path_or_bytes)
+            else:
+                df = fn(io.BytesIO(path_or_bytes.getvalue()))
+            break
+        except Exception:
+            df = pd.DataFrame()
+    if df is None or df.empty:
         return pd.DataFrame()
+
+    # normalize columns to lowercase and strip
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    # standardize key columns, fill missing
+    for c in REQ_COLS:
+        if c not in df.columns:
+            df[c] = "" if c in ("image_name", "image_sha", "platform", "model") else 0.0
+    # default platform if missing/empty (external CSV)
+    df["platform"] = df["platform"].replace("", "External")
+    # keep only meaningful columns if exist
+    keep = [
+        "timestamp", "image_name", "image_sha", "platform", "model",
+        "inference_ms", "fps", "cpu_percent", "mem_percent", "rss_mb", "detections"
+    ]
+    for c in keep:
+        if c not in df.columns:
+            # create missing numeric columns
+            df[c] = 0 if c in ("inference_ms", "fps", "cpu_percent", "mem_percent", "rss_mb", "detections") else ""
+    # coerce numeric
+    for c in ["inference_ms", "fps", "cpu_percent", "mem_percent", "rss_mb", "detections"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+    return df[keep]
 
 def _load_all_logs() -> pd.DataFrame:
     frames = []
@@ -163,14 +210,8 @@ def _load_all_logs() -> pd.DataFrame:
             "timestamp","image_name","image_sha","platform","model",
             "inference_ms","fps","cpu_percent","mem_percent","rss_mb","detections"
         ])
-    df = pd.concat(frames, ignore_index=True).fillna("")
-    # normalize column names (handle user CSV variants)
-    df.columns = [c.strip().lower() for c in df.columns]
-    # ensure required columns exist
-    for col in ["image_name","image_sha","platform","model","inference_ms","fps"]:
-        if col not in df.columns:
-            df[col] = "" if col in ("image_name","image_sha","platform","model") else 0.0
-    return df
+    df = pd.concat(frames, ignore_index=True)
+    return df.fillna("")
 
 df_all = _load_all_logs()
 
@@ -178,20 +219,20 @@ df_all = _load_all_logs()
 default_img_name = Path(selected_image_path).name if selected_image_path else ""
 img_name = st.text_input("Image name to compare (fallback when image_sha is missing):", value=default_img_name)
 
-# allow direct SHA filtering (最精确)
+# allow direct SHA filtering (most accurate)
 img_sha = st.text_input("Image SHA (optional, auto-logged locally):", value="")
 
 # ---- filtering ----
 def _filter_same_image(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
     if img_sha:
-        m = (df.get("image_sha", "") == img_sha)
-        sub = df[m]
+        sub = df[df["image_sha"] == img_sha]
         if len(sub) > 0:
             return sub
-    # fallback by name if sha not provided or not found
     if img_name:
-        return df[df.get("image_name", "") == img_name]
-    return df
+        return df[df["image_name"] == img_name]
+    return df.iloc[0:0]
 
 sub = _filter_same_image(df_all)
 
@@ -200,10 +241,11 @@ metric = st.selectbox("Metric to compare", ["inference_ms", "fps"])
 group_cols = st.multiselect("Group by", ["platform", "model"], default=["platform", "model"])
 
 if st.button("Build Comparison"):
-
-    if sub.empty:
+    if df_all.empty:
+        st.warning("No logs found. Run a local detection or upload CSV files first.")
+    elif sub.empty:
         st.warning("No matching rows for this image. "
-                   "Run detection locally first (to create a SHA), or provide CSV with image_name/image_sha.")
+                   "Run detection locally (to create a SHA), or upload CSV with image_name/image_sha.")
     else:
         # table
         show_cols = ["timestamp","image_name","image_sha","platform","model","inference_ms","fps","detections"]

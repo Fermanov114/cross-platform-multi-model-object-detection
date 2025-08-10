@@ -1,0 +1,5 @@
+# Ignore images in live_input folder
+live_input/*.jpg
+live_input/*.jpeg
+live_input/*.png
+live_input/*.bmp
