@@ -103,7 +103,11 @@ if selected_image_path:
 
             # ---- CPU panel ----
             st.markdown("### CPU")
-            c_img, c_data = st.columns([2, 1], vertical_alignment="top")
+            try:
+                c_img, c_data = st.columns([2, 1], vertical_alignment="top")
+            except TypeError:
+                # for older streamlit versions without vertical_alignment
+                c_img, c_data = st.columns([2, 1])
             with c_img:
                 st.image(str(cpu_path), use_container_width=True, caption=f"{model_name} — CPU")
             with c_data:
@@ -114,13 +118,21 @@ if selected_image_path:
                 st.metric("Inference Time (ms)", f"{cpu_metrics['inference_ms']:.1f}")
                 st.metric("FPS", f"{cpu_metrics['fps']:.2f}")
                 st.metric("CPU / Memory", f"{cpu_metrics['cpu_percent']}% / {cpu_metrics['mem_percent']}%")
+                # Optional quick stats if available
+                if "detections" in cpu_metrics:
+                    st.metric("Detections", f"{cpu_metrics['detections']}")
+                if "avg_confidence" in cpu_metrics:
+                    st.metric("Avg Confidence", f"{cpu_metrics['avg_confidence']:.3f}")
 
             st.divider()
 
             # ---- GPU panel ----
             st.markdown("### GPU")
             if gpu_path and gpu_metrics:
-                g_img, g_data = st.columns([2, 1], vertical_alignment="top")
+                try:
+                    g_img, g_data = st.columns([2, 1], vertical_alignment="top")
+                except TypeError:
+                    g_img, g_data = st.columns([2, 1])
                 with g_img:
                     st.image(str(gpu_path), use_container_width=True, caption=f"{model_name} — GPU")
                 with g_data:
@@ -131,6 +143,10 @@ if selected_image_path:
                     st.metric("Inference Time (ms)", f"{gpu_metrics['inference_ms']:.1f}")
                     st.metric("FPS", f"{gpu_metrics['fps']:.2f}")
                     st.metric("CPU / Memory", f"{gpu_metrics['cpu_percent']}% / {gpu_metrics['mem_percent']}%")
+                    if "detections" in gpu_metrics:
+                        st.metric("Detections", f"{gpu_metrics['detections']}")
+                    if "avg_confidence" in gpu_metrics:
+                        st.metric("Avg Confidence", f"{gpu_metrics['avg_confidence']:.3f}")
             else:
                 st.warning("GPU is not available on this machine or GPU inference was skipped.")
         except Exception as e:
@@ -141,11 +157,19 @@ if selected_image_path:
 # =======================================================================
 st.header("Cross-Platform Comparison")
 
-st.markdown(
-    "- Compare the **same image** across **multiple platforms**.\n"
-    "- Upload external CSV(s) from other devices (e.g., FPGA, Jetson, Raspberry Pi). "
-    "Required columns: `platform, model, inference_ms, fps` and either `image_sha` or `image_name`."
+st.markdown(    
+      """
+- Compare the **same image** across **multiple platforms**.
+- Upload external CSV(s) from other devices (e.g., FPGA, Jetson, Raspberry Pi). 
+- **External CSV format — 11 columns, fixed order (required):**
+```csv
+image_name,image_sha,platform,model,inference_ms,fps,cpu_percent,mem_percent,rss_mb,detections,avg_confidence
+Matching uses image_sha (preferred). If SHA is empty, image_name will be used.
+avg_confidence must be in [0,1]. If your platform exports percentage, divide by 100.
+
+"""
 )
+
 
 # ---- CSV uploader (multi) ----
 ext_csv_files = st.file_uploader(
@@ -154,6 +178,8 @@ ext_csv_files = st.file_uploader(
 
 # ---------- utilities ----------
 REQ_COLS = ["image_name", "image_sha", "platform", "model", "inference_ms", "fps"]
+# extra columns for comparison
+EXTRA_COLS = ["detections", "avg_confidence"]
 
 def _read_csv_any(path_or_bytes) -> pd.DataFrame:
     # robust loader: tolerate bad lines / encodings / mixed columns
@@ -181,19 +207,24 @@ def _read_csv_any(path_or_bytes) -> pd.DataFrame:
     for c in REQ_COLS:
         if c not in df.columns:
             df[c] = "" if c in ("image_name", "image_sha", "platform", "model") else 0.0
+    # ensure extra columns exist
+    for c in EXTRA_COLS:
+        if c not in df.columns:
+            df[c] = 0.0
+
     # default platform if missing/empty (external CSV)
     df["platform"] = df["platform"].replace("", "External")
     # keep only meaningful columns if exist
     keep = [
         "timestamp", "image_name", "image_sha", "platform", "model",
-        "inference_ms", "fps", "cpu_percent", "mem_percent", "rss_mb", "detections"
+        "inference_ms", "fps", "cpu_percent", "mem_percent", "rss_mb", "detections", "avg_confidence"
     ]
     for c in keep:
         if c not in df.columns:
             # create missing numeric columns
-            df[c] = 0 if c in ("inference_ms", "fps", "cpu_percent", "mem_percent", "rss_mb", "detections") else ""
+            df[c] = 0 if c in ("inference_ms", "fps", "cpu_percent", "mem_percent", "rss_mb", "detections", "avg_confidence") else ""
     # coerce numeric
-    for c in ["inference_ms", "fps", "cpu_percent", "mem_percent", "rss_mb", "detections"]:
+    for c in ["inference_ms", "fps", "cpu_percent", "mem_percent", "rss_mb", "detections", "avg_confidence"]:
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
     return df[keep]
 
@@ -208,7 +239,7 @@ def _load_all_logs() -> pd.DataFrame:
     if not frames:
         return pd.DataFrame(columns=[
             "timestamp","image_name","image_sha","platform","model",
-            "inference_ms","fps","cpu_percent","mem_percent","rss_mb","detections"
+            "inference_ms","fps","cpu_percent","mem_percent","rss_mb","detections","avg_confidence"
         ])
     df = pd.concat(frames, ignore_index=True)
     return df.fillna("")
@@ -237,7 +268,7 @@ def _filter_same_image(df: pd.DataFrame) -> pd.DataFrame:
 sub = _filter_same_image(df_all)
 
 # ---- user options ----
-metric = st.selectbox("Metric to compare", ["inference_ms", "fps"])
+metric = st.selectbox("Metric to compare", ["inference_ms", "fps", "detections", "avg_confidence"])
 group_cols = st.multiselect("Group by", ["platform", "model"], default=["platform", "model"])
 
 if st.button("Build Comparison"):
@@ -248,10 +279,10 @@ if st.button("Build Comparison"):
                    "Run detection locally (to create a SHA), or upload CSV with image_name/image_sha.")
     else:
         # table
-        show_cols = ["timestamp","image_name","image_sha","platform","model","inference_ms","fps","detections"]
+        show_cols = ["timestamp","image_name","image_sha","platform","model","inference_ms","fps","detections","avg_confidence"]
         show_cols = [c for c in show_cols if c in sub.columns]
         st.markdown("#### Matched rows")
-        st.dataframe(sub[show_cols].sort_values(by=metric, ascending=(metric=="inference_ms")))
+        st.dataframe(sub[show_cols].sort_values(by=metric, ascending=(metric in ["inference_ms"])))
 
         # aggregate (if duplicates)
         gb = sub.groupby(group_cols, dropna=False, as_index=False)[metric].mean()
@@ -262,6 +293,7 @@ if st.button("Build Comparison"):
         plt.bar(x_labels, gb[metric].values)
         plt.ylabel(metric)
         plt.xlabel(" / ".join(group_cols))
-        plt.title(f"{metric} comparison for the same image")
+        title_hint = "higher is better" if metric in ["fps", "detections", "avg_confidence"] else "lower is better"
+        plt.title(f"{metric} comparison for the same image ({title_hint})")
         plt.xticks(rotation=20, ha="right")
         st.pyplot(fig, clear_figure=True)

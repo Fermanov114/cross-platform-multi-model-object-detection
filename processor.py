@@ -1,4 +1,4 @@
-# processor.py
+# processor.py (only the minimal parts changed to include image_name & image_sha in logs)
 import time
 import cv2
 import torch
@@ -11,7 +11,6 @@ from config import RESULTS_DIR, LOG_FILE
 from log_utils import append_log_entry
 from yolo_wrapper import infer
 
-# ---------- drawing helpers ----------
 def _banner(image, text_lines, color=(30, 144, 255)) -> None:
     h, w = image.shape[:2]
     pad = 8
@@ -38,19 +37,19 @@ def _annotate(image, detections, header_lines, device: str) -> None:
     _draw_detections(image, detections, box_color=color)
     _banner(image, header_lines, color=color)
 
-# ---------- core inference ----------
-def _image_sha(img_bgr) -> str:
-    ok, buf = cv2.imencode(".png", img_bgr)
-    if not ok:
-        return ""
-    return hashlib.sha1(buf.tobytes()).hexdigest()
-
 def _run_single(img_bgr, model_name: str, device: str, platform_label: str,
-                base_stem: str, image_sha: str, image_name: str) -> Tuple[Path, Dict]:
+                base_stem: str, image_name: str, image_sha: str) -> Tuple[Path, Dict]:
     start = time.time()
-    dets = infer(img_bgr, model_name, device=device)
+    dets = infer(img_bgr, model_name, device=device)  # device is 'cpu' or 'cuda'
     inf_ms = (time.time() - start) * 1000.0
     fps = 1000.0 / inf_ms if inf_ms > 0 else 0.0
+
+    # compute new fields
+    det_count = len(dets or [])
+    if det_count > 0:
+        avg_conf = sum(float(d.get("confidence", 0.0)) for d in dets) / det_count
+    else:
+        avg_conf = 0.0
 
     proc = psutil.Process()
     cpu_pct = psutil.cpu_percent(interval=None)
@@ -60,7 +59,7 @@ def _run_single(img_bgr, model_name: str, device: str, platform_label: str,
     header = [
         f"Model: {model_name}",
         f"Device: {platform_label}",
-        f"Inference: {inf_ms:.2f} ms | FPS: {fps:.2f}"
+        f"Inference: {inf_ms:.2f} ms | FPS: {fps:.2f} | Det: {det_count} | AvgConf: {avg_conf:.2f}"
     ]
     vis = img_bgr.copy()
     _annotate(vis, dets, header, device=device)
@@ -69,10 +68,13 @@ def _run_single(img_bgr, model_name: str, device: str, platform_label: str,
     out_path = RESULTS_DIR / f"{base_stem}_{model_name}_{platform_label}_{int(time.time())}.jpg"
     cv2.imwrite(str(out_path), vis)
 
-    # ---- log with image identity ----
+    # log row with image name/sha + detections + avg_confidence (handled compatibly by log_utils)
     append_log_entry(
-        LOG_FILE, platform_label, model_name, inf_ms, fps, cpu_pct, mem_pct, rss_mb,
-        image_name=image_name, image_sha=image_sha, detections=len(dets or [])
+        LOG_FILE,
+        platform_label, model_name,
+        inf_ms, fps, cpu_pct, mem_pct, rss_mb,
+        detections=det_count, avg_confidence=avg_conf,
+        image_name=image_name, image_sha=image_sha
     )
 
     metrics = {
@@ -83,7 +85,8 @@ def _run_single(img_bgr, model_name: str, device: str, platform_label: str,
         "cpu_percent": round(cpu_pct, 1),
         "mem_percent": round(mem_pct, 1),
         "rss_mb": round(rss_mb, 1),
-        "detections": len(dets or []),
+        "detections": det_count,
+        "avg_confidence": round(avg_conf, 4),
         "detections_list": dets or []
     }
     return out_path, metrics
@@ -95,22 +98,34 @@ def process_image_dual(image_path: str, model_name: str) -> Tuple[Path, Optional
         raise ValueError(f"Cannot read image: {image_path}")
 
     base_stem = image_path.stem
-    img_sha = _image_sha(img)
-    img_name = image_path.name
+    image_name = image_path.name
+    # compute a stable SHA for matching (same image across platforms)
+    ok, buf = cv2.imencode(".png", img)
+    image_sha = ""
+    if ok:
+        image_sha = hashlib.sha1(buf.tobytes()).hexdigest()
 
     cpu_path, cpu_metrics = _run_single(
-        img_bgr=img, model_name=model_name, device="cpu",
-        platform_label="LocalCPU", base_stem=base_stem,
-        image_sha=img_sha, image_name=img_name
+        img_bgr=img,
+        model_name=model_name,
+        device="cpu",
+        platform_label="LocalCPU",
+        base_stem=base_stem,
+        image_name=image_name,
+        image_sha=image_sha
     )
 
     gpu_path, gpu_metrics = None, None
     if torch.cuda.is_available():
         try:
             gpu_path, gpu_metrics = _run_single(
-                img_bgr=img, model_name=model_name, device="cuda",
-                platform_label="LocalGPU", base_stem=base_stem,
-                image_sha=img_sha, image_name=img_name
+                img_bgr=img,
+                model_name=model_name,
+                device="cuda",
+                platform_label="LocalGPU",
+                base_stem=base_stem,
+                image_name=image_name,
+                image_sha=image_sha
             )
         except Exception:
             gpu_path, gpu_metrics = None, None
