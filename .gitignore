@@ -8,3 +8,5 @@ live_input/*.bmp
 results/*
 !results/.gitkeep
 
+# local helper scripts (do not push)
+push_to_github.sh
