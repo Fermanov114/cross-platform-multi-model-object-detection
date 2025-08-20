@@ -10,3 +10,8 @@ results/*
 
 # local helper scripts (do not push)
 push_to_github.sh
+件
+live_input/*
+
+
+!live_input/.gitkeep
